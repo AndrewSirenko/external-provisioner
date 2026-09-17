@@ -31,7 +31,6 @@ import (
 
 	"github.com/container-storage-interface/spec/lib/go/csi"
 	"github.com/prometheus/client_golang/prometheus"
-	"github.com/prometheus/client_golang/prometheus/promhttp"
 	flag "github.com/spf13/pflag"
 	v1 "k8s.io/api/core/v1"
 	storagev1 "k8s.io/api/storage/v1"
@@ -55,9 +54,6 @@ import (
 	logsapi "k8s.io/component-base/logs/api/v1"
 	_ "k8s.io/component-base/logs/json/register"
 	"k8s.io/component-base/metrics/legacyregistry"
-	_ "k8s.io/component-base/metrics/prometheus/clientgo/leaderelection" // register leader election in the default legacy registry
-	_ "k8s.io/component-base/metrics/prometheus/restclient"              // register client-go REST client metrics (incl. rate limiter latency)
-	_ "k8s.io/component-base/metrics/prometheus/workqueue"               // register work queues in the default legacy registry
 	csitrans "k8s.io/csi-translation-lib"
 	"k8s.io/klog/v2"
 	"sigs.k8s.io/sig-storage-lib-external-provisioner/v13/controller"
@@ -277,17 +273,6 @@ func main() {
 
 	// Prepare http endpoint for metrics + leader election healthz
 	mux := http.NewServeMux()
-	gatherers := prometheus.Gatherers{
-		// For workqueue and leader election metrics, set up via the anonymous imports of:
-		// https://github.com/kubernetes/kubernetes/blob/master/staging/src/k8s.io/component-base/metrics/prometheus/workqueue/metrics.go
-		// https://github.com/kubernetes/kubernetes/blob/master/staging/src/k8s.io/component-base/metrics/prometheus/clientgo/leaderelection/metrics.go
-		//
-		// Also to happens to include Go runtime and process metrics:
-		// https://github.com/kubernetes/kubernetes/blob/9780d88cb6a4b5b067256ecb4abf56892093ee87/staging/src/k8s.io/component-base/metrics/legacyregistry/registry.go#L46-L49
-		legacyregistry.DefaultGatherer,
-		// For CSI operations.
-		metricsManager.GetRegistry(),
-	}
 
 	pluginCapabilities, controllerCapabilities, err := ctrl.GetDriverCapabilities(grpcClient, *operationTimeout)
 	if err != nil {
@@ -563,18 +548,14 @@ func main() {
 			m.PersistentVolumeDeleteDurationSeconds,
 		}...)
 		provisionerOptions = append(provisionerOptions, controller.MetricsInstance(m))
-		gatherers = append(gatherers, reg)
 
-		// This is similar to k8s.io/component-base/metrics HandlerWithReset
-		// except that we gather from multiple sources. This is necessary
-		// because both CSI metrics manager and component-base manage
-		// their own registry. Probably could be avoided by making
-		// CSI metrics manager a bit more flexible.
-		mux.Handle(standardflags.Configuration.MetricsPath,
-			promhttp.InstrumentMetricHandler(
-				reg,
-				promhttp.HandlerFor(gatherers, promhttp.HandlerOpts{}),
-			))
+		// Serve the provisioner's own controller metrics alongside the CSI,
+		// client-go (rest_client_*, workqueue_*, leader_election_*), Go
+		// runtime, and process metrics that csi-lib-utils' CSIMetricsManager
+		// registers and serves by default. The capacity controller metrics
+		// registered into legacyregistry above are served the same way.
+		metricsManager.WithAdditionalRegistry(reg)
+		metricsManager.RegisterToServer(mux, standardflags.Configuration.MetricsPath)
 
 		if *enableProfile {
 			klog.InfoS("Starting profiling", "endpoint", standardflags.Configuration.HttpEndpoint)
